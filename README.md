@@ -7,10 +7,10 @@ from pathlib import Path
 st.set_page_config(page_title="CPL Predictor", page_icon="🏏")
 
 st.title("🏏 CPL Match Predictor")
-st.caption("Context-first prediction — pitch, toss, form & spinners")
+st.caption("Context-first prediction with backtest tracking")
 
 # ============================================
-# DATABASE (saves predictions)
+# DATABASE
 # ============================================
 DB = Path("predictions.db")
 
@@ -24,7 +24,8 @@ def init_db():
             toss_winner TEXT, toss_decision TEXT,
             pitch_type TEXT, dew INTEGER,
             prob_team1 REAL, prob_team2 REAL,
-            predicted_winner TEXT, confidence TEXT
+            predicted_winner TEXT, confidence TEXT,
+            actual_winner TEXT DEFAULT NULL
         )
     """)
     conn.commit()
@@ -51,6 +52,12 @@ def load_predictions():
     df = pd.read_sql_query("SELECT * FROM predictions ORDER BY id DESC", conn)
     conn.close()
     return df
+
+def update_actual(pred_id, actual):
+    conn = sqlite3.connect(DB)
+    conn.execute("UPDATE predictions SET actual_winner = ? WHERE id = ?", (actual, pred_id))
+    conn.commit()
+    conn.close()
 
 init_db()
 
@@ -79,7 +86,6 @@ form2 = st.slider(f"{team2} wins (last 5)", 0, 5, 4)
 # ============================================
 if st.button("🔮 Predict Winner", type="primary"):
 
-    # ---- Scoring ----
     s1 = spin1 * 0.3 + form1 * 0.2
     s2 = spin2 * 0.3 + form2 * 0.2
 
@@ -100,7 +106,6 @@ if st.button("🔮 Predict Winner", type="primary"):
             s2 += 0.3
 
     if dew and chase_win_pct > 0.6:
-        # Dew helps chasing — team bowling first loses edge
         if toss_winner == team1 and toss_decision == "Bowl":
             s1 -= 0.3
         elif toss_winner == team2 and toss_decision == "Bowl":
@@ -115,7 +120,6 @@ if st.button("🔮 Predict Winner", type="primary"):
     lpct = min(p1, p2)
     diff = wpct - lpct
 
-    # ---- Confidence ----
     if diff >= 25:
         conf = "🔒 HIGH"
         msg = "Strong edge. Trust this pick."
@@ -129,13 +133,11 @@ if st.button("🔮 Predict Winner", type="primary"):
         conf = "🤔 LOW"
         msg = "Too close to call."
 
-    # ---- Display ----
     st.success(f"🏆 Predicted Winner: **{winner}**")
     st.metric(team1, f"{p1:.1f}%")
     st.metric(team2, f"{p2:.1f}%")
     st.info(f"Confidence: **{conf}** — {msg}")
 
-    # ---- Save ----
     save_prediction({
         "team1": team1, "team2": team2,
         "toss_winner": toss_winner, "toss_decision": toss_decision,
@@ -147,18 +149,80 @@ if st.button("🔮 Predict Winner", type="primary"):
 
 
 # ============================================
-# HISTORY (bottom of page)
+# HISTORY + ACCURACY
 # ============================================
 st.divider()
-with st.expander("📊 View Prediction History"):
-    df = load_predictions()
-    if df.empty:
-        st.info("No predictions yet. Make one above.")
+st.subheader("📊 Prediction History & Accuracy")
+
+df = load_predictions()
+
+if df.empty:
+    st.info("No predictions yet. Make one above.")
+else:
+    # ---- Accuracy metrics ----
+    resolved = df[df["actual_winner"].notna()]
+    
+    col1, col2, col3 = st.columns(3)
+    col1.metric("Total Picks", len(df))
+    col2.metric("Resolved", len(resolved))
+    
+    if not resolved.empty:
+        correct = (resolved["predicted_winner"] == resolved["actual_winner"]).sum()
+        acc = correct / len(resolved) * 100
+        col3.metric("Accuracy", f"{acc:.1f}%", f"{correct}/{len(resolved)}")
     else:
-        st.write(f"**Total predictions:** {len(df)}")
-        st.dataframe(
-            df[["timestamp", "team1", "team2", "predicted_winner", "confidence",
-                "prob_team1", "prob_team2"]],
-            use_container_width=True,
-            hide_index=True,
-        )# cricket-predictor
+        col3.metric("Accuracy", "—")
+
+    # ---- Confidence calibration ----
+    if not resolved.empty:
+        st.markdown("#### 🎯 Accuracy by Confidence Level")
+        resolved = resolved.copy()
+        resolved["correct"] = (resolved["predicted_winner"] == resolved["actual_winner"]).astype(int)
+
+        conf_stats = resolved.groupby("confidence").agg(
+            total=("id", "count"),
+            correct=("correct", "sum"),
+        ).reset_index()
+        conf_stats["accuracy"] = (conf_stats["correct"] / conf_stats["total"] * 100).round(1)
+
+        st.dataframe(conf_stats, use_container_width=True, hide_index=True)
+
+    # ---- Update actual winner ----
+    st.markdown("#### ✏️ Mark Actual Winner")
+    st.caption("Tap a match below to record the actual result.")
+
+    for _, row in df.head(10).iterrows():
+        with st.expander(f"#{row['id']} · {row['team1'][:15]} vs {row['team2'][:15]}"):
+            st.write(f"**Predicted:** {row['predicted_winner']}")
+            st.write(f"**Confidence:** {row['confidence']}")
+            st.write(f"**Probabilities:** {row['prob_team1']:.1f}% vs {row['prob_team2']:.1f}%")
+
+            options = ["—", row["team1"], row["team2"]]
+            current = row["actual_winner"] if row["actual_winner"] in options else "—"
+            choice = st.radio(
+                "Actual winner:",
+                options,
+                index=options.index(current),
+                key=f"act_{row['id']}",
+                horizontal=True,
+            )
+
+            if choice != "—" and choice != row["actual_winner"]:
+                update_actual(row["id"], choice)
+                st.rerun()
+
+            if row["actual_winner"]:
+                correct = row["predicted_winner"] == row["actual_winner"]
+                if correct:
+                    st.success("✅ Correct prediction")
+                else:
+                    st.error("❌ Wrong prediction")
+
+    # ---- Full history table ----
+    st.markdown("#### 📋 Full History")
+    st.dataframe(
+        df[["id", "timestamp", "team1", "team2", "predicted_winner",
+            "actual_winner", "confidence"]],
+        use_container_width=True,
+        hide_index=True,
+    )
